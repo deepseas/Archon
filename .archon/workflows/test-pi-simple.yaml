@@ -1,0 +1,32 @@
+name: test-pi-simple
+description: |
+  Simple test of Pi provider without MCP.
+  Tests basic prompt response and tool usage.
+
+provider: pi
+model: kiro/minimax-m2-5
+
+nodes:
+  - id: hello
+    prompt: |
+      Say "Hello from Pi!" and introduce yourself.
+      Tell me what model you're running on and what capabilities you have.
+      Keep it to 2-3 sentences.
+
+  - id: test-tools
+    prompt: |
+      Demonstrate you have access to basic tools:
+      1. Use the `bash` tool to run: echo "Testing bash tool - $(date)"
+      2. Use the `read` tool to read this workflow file itself: .archon/workflows/test-pi-simple.yaml
+      3. Summarize what you were able to do in one sentence.
+    depends_on: [hello]
+
+  - id: final-check
+    prompt: |
+      Based on the previous tests, confirm that:
+      1. Pi provider is responding to prompts
+      2. Basic tools (bash, read) are working
+      3. The workflow execution is successful
+      
+      Output "Pi provider test: PASSED" if all checks pass.
+    depends_on: [test-tools]

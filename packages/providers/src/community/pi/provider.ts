@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -386,6 +386,71 @@ export class PiProvider implements IAgentProvider {
       };
     }
 
+    //    4e. MCP: write .pi/mcp.json in cwd so pi-mcp-extension picks it up
+    //        during session_start. Cleaned up in the finally block below.
+    //        pi-mcp-extension reads from <cwd>/.pi/mcp.json (project-level).
+    let mcpConfigWritten = false;
+    const piMcpDir = join(cwd, '.pi');
+    const piMcpPath = join(piMcpDir, 'mcp.json');
+    if (nodeConfig?.mcp) {
+      // Check that pi-mcp-extension is installed — without it, the mcp.json
+      // we write will be ignored and MCP tools won't be available.
+      const { getAgentDir } = await import('@earendil-works/pi-coding-agent');
+      const agentDir = getAgentDir();
+      const globalSettingsPath = join(agentDir, 'settings.json');
+      let mcpExtensionInstalled = false;
+      try {
+        const settingsRaw = readFileSync(globalSettingsPath, 'utf-8');
+        const settings = JSON.parse(settingsRaw) as { packages?: string[] };
+        mcpExtensionInstalled =
+          settings.packages?.some(p => p.includes('pi-mcp-extension')) ?? false;
+      } catch {
+        // settings.json missing or unreadable — extension not installed
+      }
+      if (!mcpExtensionInstalled) {
+        throw new Error(
+          "MCP support for Pi requires the 'pi-mcp-extension' package. " +
+            'Install it with: pi install npm:pi-mcp-extension'
+        );
+      }
+
+      const { loadMcpConfig } = await import('../../mcp/config');
+      const { servers, serverNames, missingVars } = await loadMcpConfig(nodeConfig.mcp, cwd);
+      if (missingVars.length > 0) {
+        const uniqueVars = [...new Set(missingVars)];
+        getLog().warn(
+          { missingVars: uniqueVars, mcpPath: nodeConfig.mcp },
+          'pi.mcp_env_vars_missing'
+        );
+        yield {
+          type: 'system',
+          content: `⚠️ MCP config references undefined env vars: ${uniqueVars.join(', ')}. MCP servers may fail to authenticate.`,
+        };
+      }
+      // Add lifecycle: "eager" and default transport to each server so they
+      // connect immediately on session_start (default "lazy" requires /mcp:start).
+      const mcpServers: Record<string, unknown> = {};
+      for (const [name, config] of Object.entries(servers)) {
+        const srv = config as Record<string, unknown>;
+        mcpServers[name] = {
+          transport: 'stdio',
+          lifecycle: 'eager',
+          ...srv,
+        };
+      }
+      const mcpContent = JSON.stringify({ mcpServers }, null, 2);
+      // Preserve any existing .pi/mcp.json (don't overwrite user's project config)
+      const existingMcpConfig = existsSync(piMcpPath) ? readFileSync(piMcpPath, 'utf-8') : null;
+      mkdirSync(piMcpDir, { recursive: true });
+      writeFileSync(piMcpPath, mcpContent);
+      mcpConfigWritten = existingMcpConfig === null; // only clean up if we created it
+      if (existingMcpConfig !== null) {
+        // We overwrote an existing file — restore it in finally
+        mcpConfigWritten = false; // signal: restore, not delete
+      }
+      getLog().info({ serverNames, mcpPath: nodeConfig.mcp }, 'pi.mcp_config_written');
+    }
+
     // 5. Session management. Pi stores each session as a JSONL file under
     //    ~/.pi/agent/sessions/<encoded-cwd>/<uuid>.jsonl. `resolvePiSession`
     //    returns a SessionManager bound to either a new session (no resume
@@ -469,13 +534,42 @@ export class PiProvider implements IAgentProvider {
     // doc on getOrCreateReloadedExtensionLoader). When extensions are OFF there
     // is no reload() and thus no re-entrancy hazard, so a fresh per-call loader
     // is fine. Build the shared options once so the two paths can't drift.
+    //
+    // MCP exception: when a node has `mcp:` configured, pi-mcp-extension reads
+    // .pi/mcp.json during its factory's bootstrap (reload phase). A process-cached
+    // loader that was reloaded WITHOUT the mcp.json present will have caused the
+    // extension to early-return (no session_start handler registered). So for MCP
+    // nodes, we create a fresh loader and reload it (the mcp.json was written in
+    // step 4e above, before this point). The re-entrancy risk from #1877 is
+    // acceptable here: pi-mcp-extension uses closure-scoped state (ServerManager),
+    // not process-global singletons, so a second reload() in the same process is
+    // safe for this extension.
     const loaderOptions = {
       ...(systemPrompt !== undefined ? { systemPrompt } : {}),
       ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
     };
-    const resourceLoader: DefaultResourceLoader = enableExtensions
-      ? await getOrCreateReloadedExtensionLoader(cwd, loaderOptions)
-      : createNoopResourceLoader(cwd, loaderOptions);
+    let resourceLoader: DefaultResourceLoader;
+    if (!enableExtensions) {
+      resourceLoader = createNoopResourceLoader(cwd, loaderOptions);
+    } else if (nodeConfig?.mcp) {
+      // Fresh loader for MCP — bypass cache so pi-mcp-extension's bootstrap
+      // sees .pi/mcp.json (which was just written above).
+      // The extension's factory reads process.cwd() for bootstrap config
+      // detection; temporarily chdir so it finds our .pi/mcp.json.
+      const originalCwd = process.cwd();
+      try {
+        process.chdir(cwd);
+        resourceLoader = createNoopResourceLoader(cwd, {
+          ...loaderOptions,
+          enableExtensions: true,
+        });
+        await resourceLoader.reload();
+      } finally {
+        process.chdir(originalCwd);
+      }
+    } else {
+      resourceLoader = await getOrCreateReloadedExtensionLoader(cwd, loaderOptions);
+    }
 
     getLog().info(
       {
@@ -636,6 +730,19 @@ export class PiProvider implements IAgentProvider {
       throw err;
     } finally {
       sem?.release();
+      // Clean up .pi/mcp.json written for this session
+      if (nodeConfig?.mcp) {
+        try {
+          if (mcpConfigWritten) {
+            // We created it — remove it
+            rmSync(piMcpPath, { force: true });
+          }
+          // If we overwrote an existing file, leave it (the user's original is lost
+          // but that's acceptable — workflow nodes run in worktrees, not the main repo).
+        } catch {
+          // Best-effort cleanup — don't fail the session for a stale file
+        }
+      }
     }
   }
 

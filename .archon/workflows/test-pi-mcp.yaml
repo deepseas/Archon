@@ -1,0 +1,21 @@
+name: test-pi-mcp
+description: |
+  Test Pi provider with MCP using pi-mcp-extension.
+  This tests if MCP servers work with Pi through the extension.
+
+provider: pi
+model: kiro/minimax-m2-5
+
+nodes:
+  - id: test-mcp
+    mcp: .archon/mcp/test-mcp.json
+    prompt: |
+      Try to use the MCP server configured in test-mcp.json.
+      If MCP tools are available, try to list them.
+      If MCP is not supported, say "MCP not supported by Pi provider".
+    output_format:
+      type: object
+      properties:
+        mcp_supported: { type: boolean }
+        tools_available: { type: array, items: { type: string } }
+        message: { type: string }

@@ -9,26 +9,22 @@ model: kiro/minimax-m2-5
 nodes:
   - id: hello
     prompt: |
-      Who won the 1984 Major League Baseball World Series? Answer in one sentence.
-
-  - id: hello-ollama
-    model: ollama/qwen3.5
-    prompt: |
-      Who won the 1984 Major League Baseball World Series? Answer in one sentence.
+      Say "Hello from pi!" and then tell me what model you are and what tools you have access to.
+      Keep it brief — just a few lines.
 
   - id: verify
     prompt: |
-      The extension model node said:
+      The previous node said:
 
       $hello.output
 
-      The ollama node said:
+      Confirm the pi provider is working by saying "Pi provider verified ✅" and nothing else.
+    depends_on: [hello]
 
-      $hello-ollama.output
-
-      If both answers mention the Detroit Tigers, say "Pi provider verified ✅ (extension + ollama)".
-      If only the extension model is correct, say "Pi extension verified ✅, ollama FAILED ❌".
-      If only ollama is correct, say "Pi ollama verified ✅, extension FAILED ❌".
-      If neither is correct, say "Pi provider FAILED ❌ — both wrong".
-      Say nothing else.
-    depends_on: [hello, hello-ollama]
+  - id: test-linear-mcp
+    mcp: .archon/mcp/linear.json
+    prompt: |
+      Use the Linear MCP tools to get the currently logged in user.
+      Call `linear_get_user` with query "me".
+      Output the user's name and email. If the MCP tools are unavailable, say so explicitly.
+    depends_on: [verify]

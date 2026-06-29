@@ -18,7 +18,7 @@ import type { ProviderCapabilities } from '../../types';
  */
 export const PI_CAPABILITIES: ProviderCapabilities = {
   sessionResume: true,
-  mcp: false,
+  mcp: true,
   hooks: false,
   skills: true,
   agents: false,
